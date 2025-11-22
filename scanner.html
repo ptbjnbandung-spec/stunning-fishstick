@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stok Opname Scanner → Google Sheets</title>
+
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial;margin:12px}
+    header{display:flex;gap:12px;align-items:center}
+    button{padding:8px 12px;border-radius:6px;border:1px solid #ccc;background:#f7f7f7;cursor:pointer}
+    #video{width:320px;height:240px;background:#000}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{border:1px solid #ddd;padding:6px;text-align:left;font-size:13px}
+    .flex{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .small{font-size:12px;color:#555}
+    #master-table{max-height:200px;overflow:auto;display:block}
+  </style>
+</head>
+
+<body>
+  <header>
+    <h2>Stok Opname — Scanner HTML (ke Google Sheets)</h2>
+  </header>
+
+  <section>
+    <div class="flex">
+      <label>Apps Script WebApp URL:</label>
+      <input id="webappUrl" style="width:60%" placeholder="https://script.google.com/macros/s/AKfycbwrVSapIhFvZadhIHYeVCl72VwT_5bo5WX2g2uM8vAukjU3MEUy_GExLC9nWUw5z4I7/exec" />
+      <button id="saveUrl">Simpan</button>
+    </div>
+    <div class="small">Catatan: WebApp harus punya endpoint <code>?action=master</code> (GET) & menerima POST</div>
+  </section>
+
+  <section style="margin-top:12px">
+    <div class="flex">
+      <button id="startBtn">Mulai Kamera</button>
+      <button id="stopBtn" disabled>Stop Kamera</button>
+      <button id="loadMaster">Load Master Data</button>
+      <button id="clearLog">Clear Log</button>
+      <label class="small">Lokasi:</label>
+      <input id="locationInput" placeholder="Gudang A / Toko 1" />
+    </div>
+  </section>
+
+  <section style="margin-top:12px;display:flex;gap:16px;align-items:flex-start">
+    <div>
+      <video id="video" playsinline></video>
+      <div class="small">Arahkan barcode/QR ke kamera</div>
+    </div>
+
+    <div style="flex:1">
+      <h4>Scan Log</h4>
+      <table id="logTable">
+        <thead><tr><th>#</th><th>Waktu</th><th>Kode</th><th>Nama</th><th>Qty</th><th>Ket</th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <h4 style="margin-top:12px">Rekap Qty</h4>
+      <table id="rekapTable">
+        <thead><tr><th>Kode</th><th>Nama</th><th>Qty</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section style="margin-top:12px">
+    <h4>Master Data (Google Sheets)</h4>
+    <div id="master-table">
+      <table id="masterTable">
+        <thead><tr><th>Kode</th><th>Nama</th><th>Stok</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ZXing Scanner -->
+  <script type="module">
+    import { BrowserMultiFormatReader } from 
+    "https://unpkg.com/@zxing/library@0.19.1/esm/index.min.js";
+
+    const video = document.getElementById("video");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const loadMasterBtn = document.getElementById("loadMaster");
+    const clearLogBtn = document.getElementById("clearLog");
+    const webappUrlInput = document.getElementById("webappUrl");
+    const saveUrlBtn = document.getElementById("saveUrl");
+    const locationInput = document.getElementById("locationInput");
+
+    const logBody = document.querySelector("#logTable tbody");
+    const rekapBody = document.querySelector("#rekapTable tbody");
+    const masterBody = document.querySelector("#masterTable tbody");
+
+    const KEY_WEBAPP = "webapp_url_v1";
+    const KEY_MASTER = "master_cache_v1";
+
+    if(localStorage.getItem(KEY_WEBAPP))
+      webappUrlInput.value = localStorage.getItem(KEY_WEBAPP);
+
+    saveUrlBtn.addEventListener("click", () => {
+      localStorage.setItem(KEY_WEBAPP, webappUrlInput.value.trim());
+      alert("URL disimpan");
+    });
+
+    saveUrlBtn.click();
+
+    let codeReader = null;
+    let currentStream = null;
+
+    // START CAMERA
+    startBtn.addEventListener("click", async () => {
+      try {
+        codeReader = new BrowserMultiFormatReader();
+        const constraints = { video: { facingMode: "environment" } };
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        currentStream = stream;
+        video.srcObject = stream;
+        await video.play();
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        scanLoop();
+      } catch (e) {
+        alert("Gagal buka kamera: " + e.message);
+      }
+    });
+
+    // STOP CAMERA
+    stopBtn.addEventListener("click", () => {
+      if(currentStream){
+        currentStream.getTracks().forEach(t => t.stop());
+        video.srcObject = null;
+      }
+      if(codeReader?.reset) codeReader.reset();
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    });
+
+    // SCAN LOOP
+    async function scanLoop(){
+      if(!video || video.readyState !== 4){
+        requestAnimationFrame(scanLoop);
+        return;
+      }
+      try{
+        const res = await codeReader.decodeOnceFromVideoElement(video);
+        handleScan(res.text);
+        setTimeout(scanLoop, 700);
+      }catch{
+        requestAnimationFrame(scanLoop);
+      }
+    }
+
+    // DATA STATE
+    const rekap = {};
+    const master = {};
+    const scanLog = [];
+
+    function addLog(scan){
+      const tr = document.createElement("tr");
+      const no = logBody.children.length + 1;
+      tr.innerHTML = `<td>${no}</td><td>${scan.time}</td><td>${scan.code}</td><td>${scan.name}</td><td>${scan.qty}</td><td></td>`;
+      logBody.prepend(tr);
+    }
+
+    function rebuildRekap(){
+      rekapBody.innerHTML = "";
+      Object.keys(rekap).forEach(code => {
+        const name = master[code]?.name || "";
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${code}</td><td>${name}</td><td>${rekap[code]}</td>`;
+        rekapBody.appendChild(tr);
+      });
+    }
+
+    // HANDLE SCAN
+    function handleScan(raw){
+      const code = raw.trim();
+      const time = new Date().toLocaleString();
+      const name = master[code]?.name || "";
+      const qty = 1;
+
+      const scan = { time, code, name, qty };
+      scanLog.unshift(scan);
+      addLog(scan);
+
+      if(!rekap[code]) rekap[code] = 0;
+      rekap[code] += qty;
+      rebuildRekap();
+
+      sendToSheet(code, qty, name);
+    }
+
+    // SEND TO GOOGLE SHEETS (POST)
+    function sendToSheet(code, qty, name){
+      const webapp = localStorage.getItem(KEY_WEBAPP);
+      if(!webapp) return;
+
+      const payload = {
+        time: new Date().toISOString(),
+        code,
+        qty,
+        name,
+        location: locationInput.value || "",
+      };
+
+      fetch(webapp, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify(payload)
+      }).catch(e => console.warn("Gagal POST:", e));
+    }
+
+    // LOAD MASTER DATA
+    loadMasterBtn.addEventListener("click", async () => {
+      const webapp = localStorage.getItem(KEY_WEBAPP);
+      if(!webapp){
+        alert("Isi URL WebApp dulu");
+        return;
+      }
+
+      try{
+        const url = new URL(webapp);
+        url.searchParams.set("action","master");
+        const res = await fetch(url);
+        const data = await res.json();
+
+        masterBody.innerHTML = "";
+        data.forEach(row => {
+          master[row.kode] = { name: row.nama, stok: row.stok };
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            `<td>${row.kode}</td><td>${row.nama}</td><td>${row.stok}</td>`;
+          masterBody.appendChild(tr);
+        });
+
+        localStorage.setItem(KEY_MASTER, JSON.stringify(data));
+
+        alert(`Master terload: ${data.length} baris`);
+      }catch(e){
+        alert("Gagal load: " + e.message);
+      }
+    });
+
+    // CLEAR LOG
+    clearLogBtn.addEventListener("click", ()=>{
+      if(!confirm("Hapus log halaman?")) return;
+      logBody.innerHTML = "";
+      rekapBody.innerHTML = "";
+      Object.keys(rekap).forEach(k => delete rekap[k]);
+    });
+
+    // RESTORE MASTER CACHE
+    window.onload = () => {
+      const cached = localStorage.getItem(KEY_MASTER);
+      if(cached){
+        try{
+          const data = JSON.parse(cached);
+          data.forEach(r=>{
+            master[r.kode] = { name:r.nama, stok:r.stok };
+            const tr=document.createElement("tr");
+            tr.innerHTML=`<td>${r.kode}</td><td>${r.nama}</td><td>${r.stok}</td>`;
+            masterBody.appendChild(tr);
+          });
+        }catch{}
+      }
+    };
+  </script>
+
+</body>
+</html>
